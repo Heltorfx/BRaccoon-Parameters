@@ -32,9 +32,10 @@ fixed MLWE/MSIS instances:
 - signature MSIS.
 
 It also recomputes the BRaccoon bounds, signature/public-key sizes, and the R1CS
-constraint estimate for `L_1,2`, using the current convention with one
-in-circuit Poseidon hash `H(mu,w)`, where `mu=H(msg,vk)` is a `2*lambda`-bit
-digest.
+constraint estimate for `L_1,2`.  The current convention counts an in-circuit
+Poseidon hash `mu=H(vk,msg)`, where `msg` is represented by 256 field elements
+and `vk` by a `2*lambda`-bit seed, followed by the in-circuit challenge hash
+`H(mu,w)`.
 
 ## Useful options
 

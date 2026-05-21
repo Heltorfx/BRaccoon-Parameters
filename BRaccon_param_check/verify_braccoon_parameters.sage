@@ -329,6 +329,33 @@ def auto_hash_state_candidates(field_bits, security_bits, input_len, capacity):
     return tuple(sorted(state for state in candidates if cap < state <= max_auto_state))
 
 
+def select_poseidon_hash(field_bits, target_bits, input_len, args):
+    hash_states = args.r1cs_hash_states
+    if not hash_states:
+        hash_states = auto_hash_state_candidates(
+            field_bits,
+            target_bits,
+            input_len,
+            args.r1cs_hash_capacity,
+        )
+
+    best_hash = None
+    for state in hash_states:
+        hp = poseidon_constraints(
+            field_bits,
+            target_bits,
+            state,
+            args.r1cs_hash_alpha,
+            args.r1cs_hash_capacity,
+        )
+        perms = int(math.ceil(input_len / hp["rate"]))
+        constraints = perms * hp["permutation_constraints"]
+        candidate = (constraints, perms, hp)
+        if best_hash is None or candidate[0] < best_hash[0]:
+            best_hash = candidate
+    return best_hash
+
+
 def estimate_r1cs(params, q, target_bits, args):
     n = params.ring_degree
     k = params.module_dim
@@ -352,36 +379,31 @@ def estimate_r1cs(params, q, target_bits, args):
     if mu_elements is None:
         mu_elements = digest_element_count(target_bits, field_bits)
 
+    msg_elements = args.r1cs_msg_elements
+    vk_elements = args.r1cs_vk_elements
+    if vk_elements is None:
+        vk_elements = digest_element_count(target_bits, field_bits)
+
+    digest_hash_input_len = msg_elements + vk_elements
+    digest_hash_constraints, digest_hash_perms, digest_hash_poseidon = select_poseidon_hash(
+        field_bits,
+        target_bits,
+        digest_hash_input_len,
+        args,
+    )
+
     w_bound = rounded_value_inf_bound(q, params.nu_w)
     w_coeff_bits = ceil_log2_int(2 * w_bound + 1)
     auto_w_elements, w_pack_coeffs = packed_element_count(k * n, w_coeff_bits, q)
     w_elements = args.r1cs_w_elements if args.r1cs_w_elements is not None else auto_w_elements
 
-    hash_input_len = mu_elements + w_elements
-    hash_states = args.r1cs_hash_states
-    if not hash_states:
-        hash_states = auto_hash_state_candidates(
-            field_bits,
-            target_bits,
-            hash_input_len,
-            args.r1cs_hash_capacity,
-        )
-
-    best_hash = None
-    for state in hash_states:
-        hp = poseidon_constraints(
-            field_bits,
-            target_bits,
-            state,
-            args.r1cs_hash_alpha,
-            args.r1cs_hash_capacity,
-        )
-        perms = int(math.ceil(hash_input_len / hp["rate"]))
-        constraints = perms * hp["permutation_constraints"]
-        candidate = (constraints, perms, hp)
-        if best_hash is None or candidate[0] < best_hash[0]:
-            best_hash = candidate
-    hash_constraints, hash_perms, hash_poseidon = best_hash
+    challenge_hash_input_len = mu_elements + w_elements
+    challenge_hash_constraints, challenge_hash_perms, challenge_hash_poseidon = select_poseidon_hash(
+        field_bits,
+        target_bits,
+        challenge_hash_input_len,
+        args,
+    )
 
     xof_poseidon = poseidon_constraints(
         field_bits,
@@ -398,27 +420,40 @@ def estimate_r1cs(params, q, target_bits, args):
         + params.challenge_weight * (3 * n + 3)
         + params.challenge_weight
     )
-    total = bdlop_constraints + hash_constraints + xof_constraints + sample_constraints
+    total = (
+        bdlop_constraints
+        + digest_hash_constraints
+        + challenge_hash_constraints
+        + xof_constraints
+        + sample_constraints
+    )
 
     return {
         "total_constraints": int(total),
         "total_log2": math.log2(total),
         "bdlop_constraints": int(bdlop_constraints),
-        "hash_mu_w_constraints": int(hash_constraints),
+        "hash_vk_msg_constraints": int(digest_hash_constraints),
+        "hash_mu_w_constraints": int(challenge_hash_constraints),
         "sample_in_ball_constraints": int(sample_constraints),
         "poseidon_xof_constraints": int(xof_constraints),
         "mu_elements": int(mu_elements),
+        "msg_elements": int(msg_elements),
+        "vk_elements": int(vk_elements),
+        "vk_seed_bits": int(2 * target_bits),
         "w_elements": int(w_elements),
         "w_coeff_bits": int(w_coeff_bits),
         "w_pack_coeffs": int(w_pack_coeffs),
-        "hash_input_len": int(hash_input_len),
-        "hash_permutations": int(hash_perms),
+        "hash_vk_msg_input_len": int(digest_hash_input_len),
+        "hash_mu_w_input_len": int(challenge_hash_input_len),
+        "hash_vk_msg_permutations": int(digest_hash_perms),
+        "hash_mu_w_permutations": int(challenge_hash_perms),
         "xof_output_elements": int(xof_output_elements),
         "xof_permutations": int(xof_perms),
         "bdlop_rows_a": int(bdlop_rows_a),
         "bdlop_message_len": int(bdlop_message_len),
         "bdlop_randomness_len": int(bdlop_randomness_len),
-        "hash_poseidon": hash_poseidon,
+        "hash_vk_msg_poseidon": digest_hash_poseidon,
+        "hash_mu_w_poseidon": challenge_hash_poseidon,
         "xof_poseidon": xof_poseidon,
     }
 
@@ -589,23 +624,36 @@ def print_result(result, target):
     r1cs = result["r1cs_l1_2"]
     if r1cs is not None:
         print(
-            "  R1CS L1,2: total={} (2^{:.2f}), BDLOP={}, H(mu,w)={}, SampleInBall={}".format(
+            "  R1CS L1,2: total={} (2^{:.2f}), BDLOP={}, H(vk,msg)={}, H(mu,w)={}, SampleInBall={}".format(
                 r1cs["total_constraints"],
                 r1cs["total_log2"],
                 r1cs["bdlop_constraints"],
+                r1cs["hash_vk_msg_constraints"],
                 r1cs["hash_mu_w_constraints"],
                 r1cs["sample_in_ball_constraints"],
             )
         )
         print(
-            "  R1CS details: mu={} field elements, w={} field elements, BDLOP shape=({}, {}, {}), Poseidon state/rate={}/{}".format(
+            "  R1CS details: msg={} field elements, vk={} field elements, mu={} field elements, w={} field elements, BDLOP shape=({}, {}, {})".format(
+                r1cs["msg_elements"],
+                r1cs["vk_elements"],
                 r1cs["mu_elements"],
                 r1cs["w_elements"],
                 r1cs["bdlop_rows_a"],
                 r1cs["bdlop_message_len"],
                 r1cs["bdlop_randomness_len"],
-                r1cs["hash_poseidon"]["state_size"],
-                r1cs["hash_poseidon"]["rate"],
+            )
+        )
+        print(
+            "  R1CS hash details: H(vk,msg) input={}, perms={}, state/rate={}/{}; H(mu,w) input={}, perms={}, state/rate={}/{}".format(
+                r1cs["hash_vk_msg_input_len"],
+                r1cs["hash_vk_msg_permutations"],
+                r1cs["hash_vk_msg_poseidon"]["state_size"],
+                r1cs["hash_vk_msg_poseidon"]["rate"],
+                r1cs["hash_mu_w_input_len"],
+                r1cs["hash_mu_w_permutations"],
+                r1cs["hash_mu_w_poseidon"]["state_size"],
+                r1cs["hash_mu_w_poseidon"]["rate"],
             )
         )
     if not result.get("summary_only", False):
@@ -643,6 +691,8 @@ def parse_args(argv=None):
     parser.add_argument("--r1cs-xof-capacity", default="auto")
     parser.add_argument("--r1cs-mu-elements", default="auto")
     parser.add_argument("--r1cs-w-elements", default="auto")
+    parser.add_argument("--r1cs-msg-elements", type=int, default=256)
+    parser.add_argument("--r1cs-vk-elements", default="auto")
     args = parser.parse_args(argv)
     args.r1cs_bdlop_message_len = parse_int_or_auto(args.r1cs_bdlop_message_len)
     args.r1cs_hash_states = parse_range_or_auto(args.r1cs_hash_states)
@@ -650,6 +700,7 @@ def parse_args(argv=None):
     args.r1cs_xof_capacity = parse_int_or_auto(args.r1cs_xof_capacity)
     args.r1cs_mu_elements = parse_int_or_auto(args.r1cs_mu_elements)
     args.r1cs_w_elements = parse_int_or_auto(args.r1cs_w_elements)
+    args.r1cs_vk_elements = parse_int_or_auto(args.r1cs_vk_elements)
     return args
 
 
@@ -665,7 +716,10 @@ def main(argv=None):
     if args.no_r1cs:
         print("R1CS: skipped")
     else:
-        print("R1CS: L_1,2 with one in-circuit hash H(mu,w), mu is a 2*lambda-bit digest")
+        print("R1CS: L_1,2 with in-circuit hashes H(vk,msg) and H(mu,w)")
+        print("R1CS convention: msg has {} field elements, vk is a 2*lambda-bit seed".format(
+            args.r1cs_msg_elements,
+        ))
     print("")
 
     results = [verify_parameter_set(params, LWE, SIS, ND, args) for params in PARAMETER_SETS]

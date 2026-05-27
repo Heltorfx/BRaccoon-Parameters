@@ -5,12 +5,7 @@
 # Dependencies:
 #   - SageMath
 #   - the lattice-estimator repository, passed with --estimator-path
-#
-# Example from the project root:
-#   sage reviewer_sage/verify_braccoon_parameters.sage --estimator-path lattice-estimator-main
-#
-# Example if this file and lattice-estimator-main are shipped side-by-side:
-#   sage verify_braccoon_parameters.sage --estimator-path lattice-estimator-main
+
 
 import argparse
 import json
@@ -57,8 +52,6 @@ def resolve_path(path_text):
     if path.is_absolute():
         candidates.append(path)
     else:
-        # Prefer the estimator bundled next to this certificate.  Reviewers can
-        # still override it with --estimator-path /path/to/their/estimator.
         candidates.append(SCRIPT_DIR / path)
         candidates.append(Path.cwd() / path)
         candidates.append(SCRIPT_DIR.parent / path)

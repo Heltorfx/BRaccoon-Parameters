@@ -43,7 +43,7 @@ rows.
 
 The approximately 110 KB size of each ZK-LaBRADOR proof is an analytical input
 from the cited implementation paper; it is not derived by this script. The BGV
-correctness calculation includes the flooding bound `B_flood=2^40`. This
+correctness calculation includes the flooding bound `B_flood=2^45`. This
 certifies decryption no-wrap under that bound, but not by itself the statistical
 translation property of the complete flooding-coin distribution required for
 chosen-key circuit privacy.
@@ -55,5 +55,3 @@ sage verify_braccoon_parameters.sage --full-estimator
 sage verify_braccoon_parameters.sage --summary-only
 sage verify_braccoon_parameters.sage --json-out results.json
 ```
-
-All sizes are reported in decimal KB, i.e. bits divided by 8000.

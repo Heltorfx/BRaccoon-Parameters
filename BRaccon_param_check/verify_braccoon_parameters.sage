@@ -45,7 +45,7 @@ class ParameterSet:
     bgv_rows: int = 10
     bgv_secret_dim: int = 18
     bgv_margin: int = 4
-    bgv_flood_bound: int = 2**40
+    bgv_flood_bound: int = 2**45
     ext_rows: int = 18
     ext_randomness: int = 15
 
@@ -56,9 +56,9 @@ class ParameterSet:
 
 
 PARAMETER_SETS = (
-    ParameterSet("Q_s=2^20", 2**20, 14, 68, 23.89, 116.74, 720.43),
-    ParameterSet("Q_s=2^32", 2**32, 16, 68, 23.91, 126.76, 778.57),
-    ParameterSet("Q_s=2^64", 2**64, 22, 69, 23.95, 156.87, 953.06),
+    ParameterSet("Q_s=2^20", 2**20, 14, 82, 28.78, 116.74, 793.78),
+    ParameterSet("Q_s=2^32", 2**32, 16, 82, 28.80, 126.76, 861.70),
+    ParameterSet("Q_s=2^64", 2**64, 22, 82, 28.84, 156.87, 1065.53),
 )
 
 
@@ -204,7 +204,14 @@ def compute_bgv_profile(p):
     b_plain = p.challenge_weight * b_t + b_wprime
     h = 2 * math.ceil(b_plain) + 1
     eval_noise = b_t * enc_noise + enc_noise
-    final_noise = eval_noise + p.bgv_flood_bound
+    flood_tail = math.sqrt(
+        (math.log(2.0 * n * p.secret_dim) + 128.0 * math.log(2.0)) / math.pi
+    )
+    flood_noise = (
+        flood_tail * p.bgv_flood_bound
+        * math.sqrt(n * (p.bgv_rows + p.bgv_secret_dim) + 1.0)
+    )
+    final_noise = eval_noise + flood_noise
     correctness_lhs = b_plain + h * final_noise
     q_min = math.ceil(2.0 * correctness_lhs * p.bgv_margin)
     q_bgv = first_prime_at_least(q_min)
@@ -213,7 +220,7 @@ def compute_bgv_profile(p):
         "rows": p.bgv_rows, "secret_dim": p.bgv_secret_dim,
         "distribution": "binary", "B_plain": b_plain, "h": h,
         "h_ok": h > 2.0 * b_plain, "B_enc": enc_noise,
-        "B_eval": eval_noise, "B_flood": p.bgv_flood_bound,
+        "B_eval": eval_noise, "B_flood": flood_noise,
         "B_final": final_noise, "correctness_lhs": correctness_lhs,
         "q_min": q_min, "q": q_bgv, "q_bits": math.log2(q_bgv),
         "q_table_bits": math.ceil(math.log2(q_bgv)),
@@ -488,7 +495,7 @@ def main(argv=None):
     print("q_sig: {} (log2={:.2f})".format(SIGNATURE_Q, math.log2(SIGNATURE_Q)))
     print("mixed-R1CS field: 2^256+1")
     print("proof-size convention: 110 KB for each of pi_1 and pi_2 (analytical input)")
-    print("BGV numerical profile: binary noise, B_flood=2^40")
+    print("BGV numerical profile: binary noise, B_flood=2^45")
     print("")
     results = [verify_parameter_set(p, LWE, SIS, ND, args) for p in PARAMETER_SETS]
     for result in results:

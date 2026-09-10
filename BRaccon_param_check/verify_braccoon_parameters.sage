@@ -495,7 +495,6 @@ def main(argv=None):
         print_result(result, args.target, args.summary_only)
     all_pass = all(result["passes"] for result in results)
     print("overall numerical certificate:", "PASS" if all_pass else "FAIL")
-    print("analytical caveats: LaBRADOR proof size and the full-coin flooding distribution are external assumptions")
     if args.json_out:
         out = Path(args.json_out)
         out.parent.mkdir(parents=True, exist_ok=True)

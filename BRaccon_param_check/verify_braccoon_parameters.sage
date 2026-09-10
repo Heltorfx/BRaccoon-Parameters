@@ -1,11 +1,10 @@
 #!/usr/bin/env sage
-#
-# Standalone verification script for the BRaccoon parameter tables.
-#
-# Dependencies:
-#   - SageMath
-#   - the lattice-estimator repository, passed with --estimator-path
+"""Fixed-parameter certificate for the current BRaccoon tables.
 
+This verifier recomputes the published numerical quantities and runs the
+bundled lattice-estimator on the associated fixed LWE/SIS instances.  It is
+not a parameter search.
+"""
 
 import argparse
 import json
@@ -15,46 +14,59 @@ import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from sage.all import next_prime, oo
+from sage.all import next_prime
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-TABLE_Q = 302231454903657293688833
+SIGNATURE_Q = 2**66 - 5
+MIXED_R1CS_MODULUS = 2**256 + 1
+KECCAK_CONSTRAINTS = 24 * 1600
+LABRADOR_PROOF_KB = 110.0
 
 
 @dataclass(frozen=True)
 class ParameterSet:
     name: str
     max_signatures: int
+    secret_dim: int
+    expected_bgv_bits: int
+    expected_ciphertext_kb: float
+    expected_ext_commitment_kb: float
+    expected_total_kb: float
     ring_degree: int = 256
-    q: int = TABLE_Q
-    q_bits: int = 78
+    q_sig: int = SIGNATURE_Q
     module_dim: int = 12
-    secret_dim: int = 12
     challenge_weight: int = 23
     nu_t: int = 52
     nu_w: int = 55
     sigma_t: int = 2**10
     sigma_wprime: int = 2**17
     sigma_w: int = 2**57
+    bgv_rows: int = 10
+    bgv_secret_dim: int = 18
+    bgv_margin: int = 4
+    bgv_flood_bound: int = 0
+    ext_rows: int = 18
+    ext_randomness: int = 15
+
+    @property
+    def q(self):
+        """Compatibility alias used by compare_reduction_bounds.py."""
+        return self.q_sig
 
 
 PARAMETER_SETS = (
-    ParameterSet("Q_s=2^20", max_signatures=2**20, secret_dim=14),
-    ParameterSet("Q_s=2^32", max_signatures=2**32, secret_dim=16),
-    ParameterSet("Q_s=2^64", max_signatures=2**64, secret_dim=22),
+    ParameterSet("Q_s=2^20", 2**20, 14, 57, 20.01, 116.74, 662.23),
+    ParameterSet("Q_s=2^32", 2**32, 16, 57, 20.02, 126.76, 712.44),
+    ParameterSet("Q_s=2^64", 2**64, 22, 58, 20.07, 156.87, 863.82),
 )
 
 
 def resolve_path(path_text):
     path = Path(path_text)
-    candidates = []
-    if path.is_absolute():
-        candidates.append(path)
-    else:
-        candidates.append(SCRIPT_DIR / path)
-        candidates.append(Path.cwd() / path)
-        candidates.append(SCRIPT_DIR.parent / path)
+    candidates = [path] if path.is_absolute() else [
+        SCRIPT_DIR / path, Path.cwd() / path, SCRIPT_DIR.parent / path,
+    ]
     for candidate in candidates:
         if candidate.exists():
             return candidate.resolve()
@@ -64,390 +76,331 @@ def resolve_path(path_text):
 def load_estimator(estimator_path):
     root = resolve_path(estimator_path)
     if not root.exists():
-        raise FileNotFoundError(
-            "Estimator path not found: {}. Pass --estimator-path /path/to/lattice-estimator-main".format(
-                root
-            )
-        )
+        raise FileNotFoundError("Estimator path not found: {}".format(root))
     sys.path.insert(0, str(root))
     from estimator import LWE, SIS, ND
-
     return LWE, SIS, ND
 
 
-def ntt_prime_at_least(value, ring_degree):
-    modulus = 2 * ring_degree
-    candidate = max(2, int(value))
-    while True:
-        candidate = int(next_prime(candidate - 1))
-        if candidate % modulus == 1 and math.gcd(candidate - 1, modulus) != 1:
-            return candidate
-        candidate += 1
-
-
-def tail_bound_inf(rejection_rate):
-    tail = 0.01
-    log_rej = math.log(rejection_rate)
-    while math.log(2.0) - (tail**2) / 2.0 > log_rej:
-        tail += 0.01
-    return tail
-
-
-def tail_bound_l2(ring_degree, rejection_rate):
-    tail = 1.01
-    log_rej = math.log(rejection_rate)
-    while ring_degree * math.log(tail) + (ring_degree / 2.0) * (1.0 - tail**2) > log_rej:
-        tail += 0.01
-    return tail
-
-
-def compute_profile(params, q, target_bits):
-    n = params.ring_degree
-    k = params.module_dim
-    ell = params.secret_dim
-    omega = params.challenge_weight
-    sessions = params.max_signatures
-    nu_t = params.nu_t
-    nu_w = params.nu_w
-    sigma_t = params.sigma_t
-    sigma_wprime = params.sigma_wprime
-    sigma_w = params.sigma_w
-
-    # Same notation as the paper/scripts: n=t=1 for the Raccoon threshold sizes.
-    threshold_n = 1.0
-    threshold_t = 1.0
-    rounding_lhs = omega * (2**nu_t) + 2 ** (nu_w + 1)
-
-    b_hmlwe = sessions * omega * (
-        1.0 + n * (target_bits + 1.0 + 2.0 * math.log2(n)) / math.sqrt(sessions)
-    )
-    sigma_mlwe = math.sqrt(
-        1.0
-        / (
-            2.0 / (threshold_n * sigma_t**2)
-            + 2.0 * b_hmlwe / (threshold_t * sigma_wprime**2)
-        )
-    )
-
-    module_sqrt = math.sqrt(n * (k + ell))
-    moddim_sqrt = math.sqrt(n * k)
-    b2_star = (
-        math.exp(0.25)
-        * (threshold_n * omega * sigma_t + threshold_t * sigma_wprime + sigma_w)
-        * module_sqrt
-        + rounding_lhs * moddim_sqrt
-    )
-    b_stmsis = b2_star + math.sqrt(omega) + rounding_lhs * moddim_sqrt
-    b_msis = b_stmsis - omega
-    q_required = math.ceil(2.0 * b_msis + 1.0)
-    q_ntt_required = ntt_prime_at_least(q_required, n)
-
-    rejection_rate = 0.01
-    tail_inf = tail_bound_inf(rejection_rate)
-    b_inf = tail_inf * sigma_t * math.sqrt(n) + tail_inf * sigma_wprime + tail_inf * sigma_w
-    challenge_bits = n
-    response_bits = n * ell * math.ceil(math.log2(b_inf))
-    hint_bits = n * k * math.ceil(math.log2(b2_star / ((2**nu_w) * moddim_sqrt)))
-    signature_bits = challenge_bits + response_bits + hint_bits
-    public_key_bits = n * k * (math.log2(q) - nu_t) + target_bits
-
-    return {
-        "B_HMLWE": b_hmlwe,
-        "sigma_MLWE": sigma_mlwe,
-        "B_2_star": b2_star,
-        "B_STMSIS": b_stmsis,
-        "B_MSIS": b_msis,
-        "q_required_bits": math.log2(q_required),
-        "q_ntt_required": q_ntt_required,
-        "q_ntt_required_bits": math.log2(q_ntt_required),
-        "q_satisfies_msis": b_msis < (q - 1) / 2.0,
-        "signature_kb": signature_bits / 8000.0,
-        "public_key_kb": public_key_bits / 8000.0,
-    }
+def first_prime_at_least(value):
+    return int(next_prime(max(2, int(math.ceil(value))) - 1))
 
 
 def min_log2_rop(result):
     if not result:
         return None
-    values = result.values() if hasattr(result, "values") else result
     bits = []
-    for item in values:
-        try:
-            rop = item.get("rop", None)
-        except AttributeError:
-            rop = None
+    for item in result.values():
+        rop = item.get("rop", None)
         if rop is None:
             continue
         try:
-            rop_float = float(rop)
+            value = float(rop)
         except Exception:
             continue
-        if rop_float > 0:
-            bits.append(math.log2(rop_float))
+        if value > 0:
+            bits.append(math.log2(value))
     return min(bits) if bits else None
 
 
-def estimate_lwe(LWE, ND, n, q, xs_sigma, xe_sigma, m, tag, rough):
-    lwe_params = LWE.Parameters(
-        n=n,
-        q=q,
-        Xs=ND.DiscreteGaussian(xs_sigma),
-        Xe=ND.DiscreteGaussian(xe_sigma),
-        m=m,
-        tag=tag,
-    )
+def estimate_lwe(LWE, ND, *, n, q, m, distribution, secret_width, error_width, tag, rough):
+    Xs = ND.Binary if distribution == "binary" else ND.DiscreteGaussian(secret_width)
+    Xe = ND.Binary if distribution == "binary" else ND.DiscreteGaussian(error_width)
+    params = LWE.Parameters(n=n, q=q, Xs=Xs, Xe=Xe, m=m, tag=tag)
     fn = LWE.estimate.rough if rough else LWE.estimate
-    result = fn(lwe_params, quiet=True)
-    return min_log2_rop(result), result
+    raw = fn(params, quiet=True)
+    return min_log2_rop(raw), raw
 
 
-def estimate_sis(SIS, n, q, m, length_bound, tag, rough):
-    sis_params = SIS.Parameters(
-        n=n,
-        q=q,
-        m=m,
-        length_bound=length_bound,
-        norm=2,
-        tag=tag,
+def estimate_sis(SIS, *, n, q, m, bound, tag, rough):
+    params = SIS.Parameters(
+        n=n, q=q, m=m, length_bound=math.ceil(bound), norm=2, tag=tag,
     )
     fn = SIS.estimate.rough if rough else SIS.estimate
-    result = fn(sis_params, quiet=True)
-    return min_log2_rop(result), result
+    raw = fn(params, quiet=True)
+    return min_log2_rop(raw), raw
 
 
-def ceil_log2_int(value):
-    if value <= 1:
-        return 0
-    return int(math.ceil(math.log2(float(value))))
-
-
-def log2_binomial(n, k):
-    if k < 0 or k > n:
-        return float("-inf")
-    return (math.lgamma(n + 1) - math.lgamma(k + 1) - math.lgamma(n - k + 1)) / math.log(2)
-
-
-def poseidon_rounds(field_bits, state_size, alpha, security_bits):
-    def satisfied(round_f, round_p):
-        sec = security_bits
-        t = state_size
-        log_alpha = math.log(alpha, 2)
-        rf1 = 6 if sec <= (math.floor(field_bits - ((alpha - 1) / 2.0)) * (t + 1)) else 10
-        rf2 = (
-            1
-            + math.ceil(math.log(2, alpha) * min(sec, field_bits))
-            + math.ceil(math.log(t, alpha))
-            - round_p
-        )
-        rf3 = math.log(2, alpha) * min(sec, field_bits) - round_p
-        rf4 = t - 1 + math.log(2, alpha) * min(sec / float(t + 1), field_bits / 2.0) - round_p
-        rf5 = (t - 2 + (sec / float(2 * log_alpha)) - round_p) / float(t - 1)
-        rf_max = max(math.ceil(rf1), math.ceil(rf2), math.ceil(rf3), math.ceil(rf4), math.ceil(rf5))
-
-        r_temp = math.floor(t / 3.0)
-        over = int(round((round_f - 1) * t + round_p + r_temp + r_temp * (round_f / 2.0) + round_p + alpha))
-        under = int(round(r_temp * (round_f / 2.0) + round_p + alpha))
-        binom_log = log2_binomial(over, under)
-        if not math.isfinite(binom_log):
-            binom_log = sec + 1
-        cost_gb4 = math.ceil(2 * binom_log)
-        return round_f >= rf_max and cost_gb4 >= sec
-
-    best = None
-    min_cost = float("inf")
-    max_cost_rf = 0
-    for round_p in range(1, 500):
-        for round_f in range(4, 100):
-            if round_f % 2 != 0 or not satisfied(round_f, round_p):
-                continue
-            rf = round_f + 2
-            rp = int(math.ceil(float(round_p) * 1.075))
-            cost = state_size * rf + rp
-            if cost < min_cost or (cost == min_cost and rf < max_cost_rf):
-                best = (rf, rp)
-                min_cost = cost
-                max_cost_rf = rf
-    if best is None:
-        raise ValueError("Could not find Poseidon rounds.")
-    return best
-
-
-def poseidon_constraints(field_bits, security_bits, state_size, alpha, capacity):
-    cap = capacity if capacity is not None else int(math.ceil((2.0 * security_bits) / field_bits))
-    if cap <= 0 or cap >= state_size:
-        raise ValueError("Invalid Poseidon capacity for state size.")
-    full_rounds, partial_rounds = poseidon_rounds(field_bits, state_size, alpha, security_bits)
-    sbox_cost = ceil_log2_int(alpha)
-    per_perm = (
-        2 * state_size * (full_rounds + partial_rounds)
-        + state_size * full_rounds * sbox_cost
-        + partial_rounds * sbox_cost
+def compute_signature_profile(p, target_bits):
+    n, k, ell = p.ring_degree, p.module_dim, p.secret_dim
+    omega, q = p.challenge_weight, p.q_sig
+    root_all, root_k = math.sqrt(n * (k + ell)), math.sqrt(n * k)
+    gaussian = math.exp(0.25)
+    b_hmlwe = p.max_signatures * omega * (
+        1.0 + n * (target_bits + 1.0 + 2.0 * math.log2(n))
+        / math.sqrt(p.max_signatures)
     )
+    sigma_mlwe = math.sqrt(
+        1.0 / (2.0 / p.sigma_t**2 + 2.0 * b_hmlwe / p.sigma_wprime**2)
+    )
+    rounding = (omega * 2**p.nu_t + 2 ** (p.nu_w + 1)) * root_k
+    b2_star = (
+        gaussian * (omega * p.sigma_t + p.sigma_wprime + p.sigma_w) * root_all
+        + rounding
+    )
+    # Current rounded-to-non-rounded reduction, with the exact remainder.
+    b_corr = gaussian * (omega * p.sigma_t + p.sigma_wprime) * root_all
+    b_w = gaussian * p.sigma_w * root_all
+    delta_rounding = (
+        omega * (2**p.nu_t - 1) + (2**p.nu_w - 1) + q % (2**p.nu_w)
+    ) * root_k
+    auxiliary_b = max(b2_star + delta_rounding, b_corr + b_w)
+    b_msis = auxiliary_b + math.sqrt(omega)
+    entropy_rhs = 2.0 * n * q ** (1.0 / (k + ell) + 2.0 / (n * ell))
+
+    tail = 0.01
+    while math.log(2.0) - tail**2 / 2.0 > math.log(0.01):
+        tail += 0.01
+    b_inf = tail * p.sigma_t * math.sqrt(n) + tail * p.sigma_wprime + tail * p.sigma_w
+    signature_bits = (
+        n + n * ell * math.ceil(math.log2(b_inf))
+        + n * k * math.ceil(math.log2(b2_star / ((2**p.nu_w) * root_k)))
+    )
+    public_key_bits = n * k * (math.log2(q) - p.nu_t) + target_bits
     return {
-        "field_bits": field_bits,
-        "state_size": state_size,
-        "capacity": cap,
-        "rate": state_size - cap,
-        "alpha": alpha,
-        "full_rounds": full_rounds,
-        "partial_rounds": partial_rounds,
-        "permutation_constraints": int(per_perm),
+        "B_HMLWE": b_hmlwe, "sigma_MLWE": sigma_mlwe,
+        "B_2_star": b2_star, "B_corr": b_corr, "B_w": b_w,
+        "delta_rounding": delta_rounding, "B_auxiliary": auxiliary_b,
+        "B_MSIS": b_msis,
+        "q_satisfies_msis": b_msis < (q - 1) / 2.0,
+        "q_half_headroom_bits": math.log2((q - 1) / (2.0 * b_msis)),
+        "entropy_rhs": entropy_rhs,
+        "entropy_sigma_ok": p.sigma_wprime > entropy_rhs,
+        "entropy_rounding_ok": p.nu_w < math.log2(q) - 2.0,
+        "min_entropy_bits": n - 1,
+        "signature_kb": signature_bits / 8000.0,
+        "public_key_kb": public_key_bits / 8000.0,
     }
 
 
-def digest_element_count(security_bits, field_bits):
-    # mu=H(msg,vk) is a 2*lambda-bit digest, i.e. 256 bits for lambda=128.
-    return max(1, int(math.ceil((2.0 * security_bits) / field_bits)))
+def compute_profile(p, q, target_bits):
+    """Legacy-bound compatibility hook for compare_reduction_bounds.py.
 
-
-def rounded_value_inf_bound(q, nu):
-    return math.ceil(((q - 1) / 2.0) / (2**nu)) + 1
-
-
-def packed_element_count(num_values, value_bits, field_modulus):
-    bits = max(1, int(value_bits))
-    pack = 1
-    while (1 << ((pack + 1) * bits)) < field_modulus:
-        pack += 1
-    return int(math.ceil(num_values / pack)), pack
-
-
-def auto_hash_state_candidates(field_bits, security_bits, input_len, capacity):
-    cap = capacity if capacity is not None else int(math.ceil((2.0 * security_bits) / field_bits))
-    candidates = {max(cap + 2, 8), 16, 32, 64, 128, 256, 512}
-    if input_len > 0:
-        for target_perms in range(1, 9):
-            candidates.add(cap + int(math.ceil(input_len / target_perms)))
-    max_auto_state = max(256, min(512, input_len + cap))
-    return tuple(sorted(state for state in candidates if cap < state <= max_auto_state))
-
-
-def select_poseidon_hash(field_bits, target_bits, input_len, args):
-    hash_states = args.r1cs_hash_states
-    if not hash_states:
-        hash_states = auto_hash_state_candidates(
-            field_bits,
-            target_bits,
-            input_len,
-            args.r1cs_hash_capacity,
-        )
-
-    best_hash = None
-    for state in hash_states:
-        hp = poseidon_constraints(
-            field_bits,
-            target_bits,
-            state,
-            args.r1cs_hash_alpha,
-            args.r1cs_hash_capacity,
-        )
-        perms = int(math.ceil(input_len / hp["rate"]))
-        constraints = perms * hp["permutation_constraints"]
-        candidate = (constraints, perms, hp)
-        if best_hash is None or candidate[0] < best_hash[0]:
-            best_hash = candidate
-    return best_hash
-
-
-def estimate_r1cs(params, q, target_bits, args):
-    n = params.ring_degree
-    k = params.module_dim
-    ell = params.secret_dim
-    field_bits = max(1, int(math.ceil(math.log2(q))))
-
-    bdlop_rows_a = args.r1cs_bdlop_rows_a
-    bdlop_message_len = args.r1cs_bdlop_message_len
-    if bdlop_message_len is None:
-        bdlop_message_len = ell + 2
-    bdlop_randomness_len = args.r1cs_bdlop_randomness
-    gamma_bit_bound = 0  # binary opening, so coefficients are already boolean.
-    bdlop_constraints = n * (
-        bdlop_rows_a
-        + 2 * bdlop_message_len
-        + 2 * bdlop_randomness_len
-        + gamma_bit_bound * bdlop_randomness_len
+    The main certificate uses compute_signature_profile and the current bound.
+    The separate comparison script still needs the former certificate input as
+    its baseline, so keep that calculation isolated here.
+    """
+    n, k, ell, omega = p.ring_degree, p.module_dim, p.secret_dim, p.challenge_weight
+    root_all, root_k = math.sqrt(n * (k + ell)), math.sqrt(n * k)
+    rounding = (omega * 2**p.nu_t + 2 ** (p.nu_w + 1)) * root_k
+    b2_star = (
+        math.exp(0.25) * (omega * p.sigma_t + p.sigma_wprime + p.sigma_w) * root_all
+        + rounding
     )
+    legacy_b_msis = b2_star + math.sqrt(omega) + rounding - omega
+    return {"B_MSIS": legacy_b_msis}
 
-    mu_elements = args.r1cs_mu_elements
-    if mu_elements is None:
-        mu_elements = digest_element_count(target_bits, field_bits)
 
-    msg_elements = args.r1cs_msg_elements
-    vk_elements = args.r1cs_vk_elements
-    if vk_elements is None:
-        vk_elements = digest_element_count(target_bits, field_bits)
-
-    digest_hash_input_len = msg_elements + vk_elements
-    digest_hash_constraints, digest_hash_perms, digest_hash_poseidon = select_poseidon_hash(
-        field_bits,
-        target_bits,
-        digest_hash_input_len,
-        args,
+def compute_bgv_profile(p):
+    n = p.ring_degree
+    dec_secret = math.sqrt(n * p.bgv_secret_dim)
+    pk_error = enc_randomness = math.sqrt(n * p.bgv_rows)
+    enc_e1, enc_e2 = math.sqrt(n * p.bgv_secret_dim), math.sqrt(n)
+    enc_noise = pk_error * enc_randomness + enc_e2 + dec_secret * enc_e1
+    b_t = math.exp(0.25) * p.sigma_t * math.sqrt(n * p.module_dim)
+    b_wprime = math.exp(0.25) * p.sigma_wprime * math.sqrt(
+        n * (p.module_dim + p.secret_dim)
     )
-
-    w_bound = rounded_value_inf_bound(q, params.nu_w)
-    w_coeff_bits = ceil_log2_int(2 * w_bound + 1)
-    auto_w_elements, w_pack_coeffs = packed_element_count(k * n, w_coeff_bits, q)
-    w_elements = args.r1cs_w_elements if args.r1cs_w_elements is not None else auto_w_elements
-
-    challenge_hash_input_len = mu_elements + w_elements
-    challenge_hash_constraints, challenge_hash_perms, challenge_hash_poseidon = select_poseidon_hash(
-        field_bits,
-        target_bits,
-        challenge_hash_input_len,
-        args,
-    )
-
-    xof_poseidon = poseidon_constraints(
-        field_bits,
-        target_bits,
-        args.r1cs_xof_state,
-        args.r1cs_xof_alpha,
-        args.r1cs_xof_capacity,
-    )
-    xof_output_elements = params.challenge_weight + int(math.ceil(params.challenge_weight / 8.0))
-    xof_perms = int(math.ceil(xof_output_elements / xof_poseidon["rate"]))
-    xof_constraints = xof_perms * xof_poseidon["permutation_constraints"]
-    sample_constraints = (
-        xof_output_elements * (field_bits + 1)
-        + params.challenge_weight * (3 * n + 3)
-        + params.challenge_weight
-    )
-    total = (
-        bdlop_constraints
-        + digest_hash_constraints
-        + challenge_hash_constraints
-        + xof_constraints
-        + sample_constraints
-    )
-
+    b_plain = p.challenge_weight * b_t + b_wprime
+    h = 2 * math.ceil(b_plain) + 1
+    eval_noise = b_t * enc_noise + enc_noise
+    final_noise = eval_noise + p.bgv_flood_bound
+    correctness_lhs = b_plain + h * final_noise
+    q_min = math.ceil(2.0 * correctness_lhs * p.bgv_margin)
+    q_bgv = first_prime_at_least(q_min)
+    ciphertext_kb = (p.bgv_rows + 1) * n * math.log2(q_bgv) / 8000.0
     return {
-        "total_constraints": int(total),
-        "total_log2": math.log2(total),
-        "bdlop_constraints": int(bdlop_constraints),
-        "hash_vk_msg_constraints": int(digest_hash_constraints),
-        "hash_mu_w_constraints": int(challenge_hash_constraints),
-        "sample_in_ball_constraints": int(sample_constraints),
-        "poseidon_xof_constraints": int(xof_constraints),
-        "mu_elements": int(mu_elements),
-        "msg_elements": int(msg_elements),
-        "vk_elements": int(vk_elements),
-        "vk_seed_bits": int(2 * target_bits),
-        "w_elements": int(w_elements),
-        "w_coeff_bits": int(w_coeff_bits),
-        "w_pack_coeffs": int(w_pack_coeffs),
-        "hash_vk_msg_input_len": int(digest_hash_input_len),
-        "hash_mu_w_input_len": int(challenge_hash_input_len),
-        "hash_vk_msg_permutations": int(digest_hash_perms),
-        "hash_mu_w_permutations": int(challenge_hash_perms),
-        "xof_output_elements": int(xof_output_elements),
-        "xof_permutations": int(xof_perms),
-        "bdlop_rows_a": int(bdlop_rows_a),
-        "bdlop_message_len": int(bdlop_message_len),
-        "bdlop_randomness_len": int(bdlop_randomness_len),
-        "hash_vk_msg_poseidon": digest_hash_poseidon,
-        "hash_mu_w_poseidon": challenge_hash_poseidon,
-        "xof_poseidon": xof_poseidon,
+        "rows": p.bgv_rows, "secret_dim": p.bgv_secret_dim,
+        "distribution": "binary", "B_plain": b_plain, "h": h,
+        "h_ok": h > 2.0 * b_plain, "B_enc": enc_noise,
+        "B_eval": eval_noise, "B_flood": p.bgv_flood_bound,
+        "B_final": final_noise, "correctness_lhs": correctness_lhs,
+        "q_min": q_min, "q": q_bgv, "q_bits": math.log2(q_bgv),
+        "q_table_bits": math.ceil(math.log2(q_bgv)),
+        "correctness_ok": correctness_lhs < q_bgv / 2.0,
+        "ciphertext_kb": ciphertext_kb,
+    }
+
+
+def compute_extractable_commitment_profile(p, q_bgv):
+    n, message_len = p.ring_degree, 2 * p.secret_dim + 1
+    opening = math.sqrt(n * p.ext_randomness)
+    extraction_noise = opening**2
+    message_bound = math.exp(0.25) * p.sigma_w * math.sqrt(
+        n * (p.module_dim + p.secret_dim)
+    )
+    h_ext = 2 * math.ceil(message_bound) + 1
+    correctness_lhs = message_bound + h_ext * extraction_noise
+    q_ext = first_prime_at_least(math.ceil(2.0 * correctness_lhs) + 1)
+    commitment_kb = (
+        (p.ext_rows + message_len) * n * math.log2(q_ext) / 8000.0
+    )
+    # All native-modulus equations are lifted independently into M.
+    conservative_expression = max(q_ext * 2, q_bgv * 2, p.q_sig * 2)
+    return {
+        "rows": p.ext_rows, "message_len": message_len,
+        "randomness": p.ext_randomness, "distribution": "binary",
+        "opening_bound": opening, "binding_bound": opening,
+        "message_bound": message_bound,
+        "extraction_noise_bound": extraction_noise,
+        "h_ext": h_ext, "h_ext_ok": h_ext > 2.0 * message_bound,
+        "correctness_lhs": correctness_lhs, "q": q_ext,
+        "q_bits": math.log2(q_ext),
+        "q_table_bits": math.ceil(math.log2(q_ext)),
+        # Compare integers here: converting the 78-bit prime back to binary64
+        # can erase the few low bits by which it exceeds the lower bound.
+        "extraction_ok": q_ext > math.ceil(2.0 * correctness_lhs) and math.gcd(h_ext, q_ext) == 1,
+        "mixed_r1cs_modulus": MIXED_R1CS_MODULUS,
+        "mixed_field_no_wrap_ok": 2.0 * conservative_expression < MIXED_R1CS_MODULUS,
+        "commitment_kb": commitment_kb,
+    }
+
+
+def padded_blocks(bit_length, rate, suffix_bits):
+    return int(math.ceil((bit_length + suffix_bits + 1) / float(rate)))
+
+
+def compute_sha3_labrador_profile(p):
+    q_w = math.ceil(p.q_sig / float(2**p.nu_w))
+    w_bits = math.ceil(math.log2(q_w))
+    serialized_w_bits = p.module_dim * p.ring_degree * w_bits
+    digest_input_bits, challenge_input_bits = 512, 256 + serialized_w_bits
+    digest_perms = padded_blocks(digest_input_bits, 1088, 2)
+    challenge_perms = padded_blocks(challenge_input_bits, 1088, 2)
+    hash_perms = digest_perms + challenge_perms
+    hash_constraints = hash_perms * KECCAK_CONSTRAINTS
+    shake_output_bits = p.challenge_weight * 160 + p.challenge_weight
+    shake_perms = int(math.ceil(shake_output_bits / 1088.0))
+    shake_constraints = shake_perms * KECCAK_CONSTRAINTS
+    fisher_yates = p.challenge_weight * (3 * p.ring_degree + 4)
+    nonlinear = hash_constraints + shake_constraints + fisher_yates
+    return {
+        "q_w": q_w, "w_coefficient_bits": w_bits,
+        "serialized_w_bits": serialized_w_bits,
+        "digest_input_bits": digest_input_bits,
+        "challenge_input_bits": challenge_input_bits,
+        "sha3_permutations": hash_perms, "sha3_constraints": hash_constraints,
+        "shake_output_bits": shake_output_bits,
+        "shake_permutations": shake_perms, "shake_constraints": shake_constraints,
+        "fisher_yates_constraints": fisher_yates,
+        "nonlinear_constraints": nonlinear,
+        "pi1_kb": LABRADOR_PROOF_KB, "pi2_kb": LABRADOR_PROOF_KB,
+        "proof_size_is_analytical": True,
+    }
+
+
+def close_to(value, expected, tolerance=0.015):
+    return abs(value - expected) <= tolerance
+
+
+def verify_parameter_set(p, LWE, SIS, ND, args):
+    rough = not args.full_estimator
+    sig, bgv = compute_signature_profile(p, args.target), compute_bgv_profile(p)
+    ext = compute_extractable_commitment_profile(p, bgv["q"])
+    zk = compute_sha3_labrador_profile(p)
+
+    vk_bits, vk_raw = estimate_lwe(
+        LWE, ND, n=p.ring_degree * p.secret_dim, q=p.q_sig,
+        m=p.ring_degree * p.module_dim, distribution="gaussian",
+        secret_width=sig["sigma_MLWE"], error_width=sig["sigma_MLWE"],
+        tag=p.name + " verification-key MLWE", rough=rough,
+    )
+    wprime_bits, wprime_raw = estimate_lwe(
+        LWE, ND, n=p.ring_degree * p.secret_dim, q=p.q_sig,
+        m=p.ring_degree * p.module_dim, distribution="gaussian",
+        secret_width=p.sigma_wprime, error_width=p.sigma_w,
+        tag=p.name + " wprime MLWE", rough=rough,
+    )
+    sig_bits, sig_raw = estimate_sis(
+        SIS, n=p.ring_degree * p.module_dim, q=p.q_sig,
+        m=p.ring_degree * (p.module_dim + p.secret_dim + 1),
+        bound=sig["B_MSIS"], tag=p.name + " signature MSIS", rough=rough,
+    )
+    bgv_bits, bgv_raw = estimate_lwe(
+        LWE, ND, n=p.ring_degree * p.bgv_secret_dim, q=bgv["q"],
+        m=p.ring_degree * p.bgv_rows, distribution="binary",
+        secret_width=0.5, error_width=0.5,
+        tag=p.name + " BGV IND-CPA MLWE", rough=rough,
+    )
+    ext_binding_bits, ext_binding_raw = estimate_sis(
+        SIS, n=p.ring_degree * p.ext_rows, q=ext["q"],
+        m=p.ring_degree * p.ext_randomness, bound=ext["binding_bound"],
+        tag=p.name + " extractable commitment binding MSIS", rough=rough,
+    )
+    ext_hiding_bits, ext_hiding_raw = estimate_lwe(
+        LWE, ND, n=p.ring_degree * p.ext_randomness, q=ext["q"],
+        m=p.ring_degree * (p.ext_rows + ext["message_len"]), distribution="binary",
+        secret_width=0.5, error_width=0.5,
+        tag=p.name + " extractable commitment hiding MLWE", rough=rough,
+    )
+    ext_setup_raw_bits, ext_setup_raw = estimate_lwe(
+        LWE, ND, n=p.ring_degree * p.ext_rows, q=ext["q"],
+        m=p.ring_degree * p.ext_randomness, distribution="binary",
+        secret_width=0.5, error_width=0.5,
+        tag=p.name + " extractable commitment setup MLWE", rough=rough,
+    )
+    ext_setup_bits = (
+        None if ext_setup_raw_bits is None
+        else ext_setup_raw_bits - math.log2(ext["message_len"])
+    )
+
+    ciphertext_count = p.secret_dim + 1
+    # The paper multiplies the component sizes after rounding them to two
+    # decimals (e.g. 17*20.02), so reproduce that convention exactly.
+    communication_total = (
+        zk["pi1_kb"] + zk["pi2_kb"]
+        + ciphertext_count * round(bgv["ciphertext_kb"], 2)
+        + round(ext["commitment_kb"], 2) + 25.34
+    )
+    expected_sig = {14: 28.00, 16: 31.78, 22: 43.10}[p.secret_dim]
+    checks = {
+        "signature_modulus_66_bits": math.ceil(math.log2(p.q_sig)) == 66,
+        "signature_msis_modulus": sig["q_satisfies_msis"],
+        "entropy_sigma": sig["entropy_sigma_ok"],
+        "entropy_rounding": sig["entropy_rounding_ok"],
+        "public_key_size": close_to(sig["public_key_kb"], 5.39),
+        "signature_size": close_to(sig["signature_kb"], expected_sig),
+        "bgv_correctness": bgv["correctness_ok"],
+        "bgv_table_modulus": bgv["q_table_bits"] == p.expected_bgv_bits,
+        "ciphertext_size": close_to(bgv["ciphertext_kb"], p.expected_ciphertext_kb),
+        "extractable_commitment_correctness": ext["extraction_ok"],
+        "extractable_commitment_modulus": ext["q_table_bits"] == 78,
+        "mixed_r1cs_no_wrap": ext["mixed_field_no_wrap_ok"],
+        "extractable_commitment_size": close_to(
+            ext["commitment_kb"], p.expected_ext_commitment_kb
+        ),
+        "sha3_constraint_count": zk["nonlinear_constraints"] == 1438556,
+        "communication_total": close_to(
+            communication_total, p.expected_total_kb, tolerance=0.06
+        ),
+    }
+    security = {
+        "verification_key_mlwe": vk_bits, "wprime_mlwe": wprime_bits,
+        "signature_msis": sig_bits, "bgv_ind_cpa_mlwe": bgv_bits,
+        "ext_binding_msis": ext_binding_bits,
+        "ext_hiding_mlwe": ext_hiding_bits,
+        "ext_setup_mlwe_after_union_bound": ext_setup_bits,
+    }
+    present = [value for value in security.values() if value is not None]
+    security_minimum = min(present)
+    security_passes = all(value >= args.target for value in present)
+    return {
+        "parameters": asdict(p), "signature": sig, "bgv": bgv,
+        "extractable_commitment": ext, "sha3_labrador": zk,
+        "communication": {
+            "ciphertext_count": ciphertext_count,
+            "ciphertexts_kb": ciphertext_count * bgv["ciphertext_kb"],
+            "wprime_kb": 25.34, "total_kb": communication_total,
+        },
+        "checks": checks,
+        "security": dict(security, minimum=security_minimum, passes=security_passes),
+        "passes": all(checks.values()) and security_passes,
+        "estimator_outputs": {
+            "verification_key_mlwe": vk_raw, "wprime_mlwe": wprime_raw,
+            "signature_msis": sig_raw, "bgv_ind_cpa_mlwe": bgv_raw,
+            "ext_binding_msis": ext_binding_raw,
+            "ext_hiding_mlwe": ext_hiding_raw, "ext_setup_mlwe": ext_setup_raw,
+        },
     }
 
 
@@ -455,281 +408,101 @@ def fmt_bits(value):
     if value is None:
         return "n/a"
     if math.isinf(value):
-        return "inf bits"
-    return "{:.2f} bits".format(value)
+        return "inf"
+    return "{:.2f}".format(value)
 
 
-def fmt_power(value):
-    if value <= 0:
-        return "0"
-    logv = math.log2(float(value))
-    if abs(logv - round(logv)) < 1e-12 and logv >= 10:
-        return "2^{}".format(int(round(logv)))
-    return "2^{:.2f} (~{:,.4g})".format(logv, float(value))
-
-
-def ascii_estimator_output(value):
-    text = pprint.pformat(value, width=100)
-    replacements = {
-        "≈": "~",
-        "β": "beta",
-        "β'": "beta'",
-        "δ": "delta",
-        "ζ": "zeta",
-        "η": "eta",
-        "σ": "sigma",
-        "α": "alpha",
-    }
-    for old, new in replacements.items():
-        text = text.replace(old, new)
-    return text
-
-
-def parse_int_or_auto(text):
-    if text is None:
-        return None
-    value = str(text).strip().lower()
-    if value in ("", "auto"):
-        return None
-    return int(eval(value, {"__builtins__": {}}, {}))
-
-
-def parse_range_or_auto(text):
-    value = str(text).strip().lower()
-    if value in ("", "auto"):
-        return ()
-    if "," in value:
-        return tuple(int(part.strip()) for part in value.split(",") if part.strip())
-    if ":" in value:
-        parts = [int(part.strip()) for part in value.split(":")]
-        if len(parts) == 2:
-            return tuple(range(parts[0], parts[1] + 1))
-        if len(parts) == 3:
-            return tuple(range(parts[0], parts[1] + 1, parts[2]))
-    return (int(value),)
-
-
-def verify_parameter_set(params, LWE, SIS, ND, args):
-    q = params.q
-    profile = compute_profile(params, q, args.target)
-    rough = not args.full_estimator
-
-    vk_mlwe, vk_mlwe_raw = estimate_lwe(
-        LWE,
-        ND,
-        n=params.ring_degree * params.secret_dim,
-        q=q,
-        xs_sigma=profile["sigma_MLWE"],
-        xe_sigma=profile["sigma_MLWE"],
-        m=params.ring_degree * params.module_dim,
-        tag=params.name + " verification-key MLWE",
-        rough=rough,
-    )
-    wprime_mlwe, wprime_mlwe_raw = estimate_lwe(
-        LWE,
-        ND,
-        n=params.ring_degree * params.secret_dim,
-        q=q,
-        xs_sigma=params.sigma_wprime,
-        xe_sigma=params.sigma_w,
-        m=params.ring_degree * params.module_dim,
-        tag=params.name + " wprime MLWE",
-        rough=rough,
-    )
-    signature_msis, signature_msis_raw = estimate_sis(
-        SIS,
-        n=params.ring_degree * params.module_dim,
-        q=q,
-        m=params.ring_degree * (params.module_dim + params.secret_dim + 1),
-        length_bound=profile["B_MSIS"],
-        tag=params.name + " signature MSIS",
-        rough=rough,
-    )
-
-    security_values = [vk_mlwe, wprime_mlwe, signature_msis]
-    minimum = min(value for value in security_values if value is not None)
-    r1cs = None if args.no_r1cs else estimate_r1cs(params, q, args.target, args)
-    passes = minimum >= args.target and profile["q_satisfies_msis"]
-
-    return {
-        "parameters": asdict(params),
-        "q": q,
-        "q_log2": math.log2(q),
-        "profile": profile,
-        "security": {
-            "verification_key_mlwe": vk_mlwe,
-            "wprime_mlwe": wprime_mlwe,
-            "signature_msis": signature_msis,
-            "minimum": minimum,
-            "passes": passes,
-        },
-        "estimator_outputs": {
-            "verification_key_mlwe": ascii_estimator_output(vk_mlwe_raw),
-            "wprime_mlwe": ascii_estimator_output(wprime_mlwe_raw),
-            "signature_msis": ascii_estimator_output(signature_msis_raw),
-        },
-        "r1cs_l1_2": r1cs,
-    }
-
-
-def print_result(result, target):
-    p = result["parameters"]
-    profile = result["profile"]
-    security = result["security"]
-    status = "PASS" if security["passes"] else "FAIL"
-    print("{} [{}]".format(p["name"], status))
-    print(
-        "  algebraic: n={}, log2(q)={:.2f}, k={}, ell={}, omega={}".format(
-            p["ring_degree"], result["q_log2"], p["module_dim"], p["secret_dim"], p["challenge_weight"]
-        )
-    )
-    print(
-        "  gaussian/rounding: sigma_t={}, sigma_wprime={}, sigma_w={}, nu_t={}, nu_w={}".format(
-            fmt_power(p["sigma_t"]),
-            fmt_power(p["sigma_wprime"]),
-            fmt_power(p["sigma_w"]),
-            p["nu_t"],
-            p["nu_w"],
-        )
-    )
-    print(
-        "  derived: B_HMLWE={}, sigma_MLWE={}, B_MSIS={}, q valid={}".format(
-            fmt_power(profile["B_HMLWE"]),
-            fmt_power(profile["sigma_MLWE"]),
-            fmt_power(profile["B_MSIS"]),
-            "yes" if profile["q_satisfies_msis"] else "no",
-        )
-    )
-    print(
-        "  sizes: vk={:.2f} KB, sig={:.2f} KB".format(
-            profile["public_key_kb"], profile["signature_kb"]
-        )
-    )
-    print(
-        "  security: VK-MLWE={}, wprime-MLWE={}, SIG-MSIS={}, min={}, target={:.0f} bits".format(
-            fmt_bits(security["verification_key_mlwe"]),
-            fmt_bits(security["wprime_mlwe"]),
-            fmt_bits(security["signature_msis"]),
-            fmt_bits(security["minimum"]),
-            target,
-        )
-    )
-    r1cs = result["r1cs_l1_2"]
-    if r1cs is not None:
-        print(
-            "  R1CS L1,2: total={} (2^{:.2f}), BDLOP={}, H(vk,msg)={}, H(mu,w)={}, SampleInBall={}".format(
-                r1cs["total_constraints"],
-                r1cs["total_log2"],
-                r1cs["bdlop_constraints"],
-                r1cs["hash_vk_msg_constraints"],
-                r1cs["hash_mu_w_constraints"],
-                r1cs["sample_in_ball_constraints"],
-            )
-        )
-        print(
-            "  R1CS details: msg={} field elements, vk={} field elements, mu={} field elements, w={} field elements, BDLOP shape=({}, {}, {})".format(
-                r1cs["msg_elements"],
-                r1cs["vk_elements"],
-                r1cs["mu_elements"],
-                r1cs["w_elements"],
-                r1cs["bdlop_rows_a"],
-                r1cs["bdlop_message_len"],
-                r1cs["bdlop_randomness_len"],
-            )
-        )
-        print(
-            "  R1CS hash details: H(vk,msg) input={}, perms={}, state/rate={}/{}; H(mu,w) input={}, perms={}, state/rate={}/{}".format(
-                r1cs["hash_vk_msg_input_len"],
-                r1cs["hash_vk_msg_permutations"],
-                r1cs["hash_vk_msg_poseidon"]["state_size"],
-                r1cs["hash_vk_msg_poseidon"]["rate"],
-                r1cs["hash_mu_w_input_len"],
-                r1cs["hash_mu_w_permutations"],
-                r1cs["hash_mu_w_poseidon"]["state_size"],
-                r1cs["hash_mu_w_poseidon"]["rate"],
-            )
-        )
-    if not result.get("summary_only", False):
-        outputs = result["estimator_outputs"]
+def print_result(result, target, summary_only):
+    p, sig = result["parameters"], result["signature"]
+    bgv, ext = result["bgv"], result["extractable_commitment"]
+    zk, comm, sec = result["sha3_labrador"], result["communication"], result["security"]
+    print("{} [{}]".format(p["name"], "PASS" if result["passes"] else "FAIL"))
+    print("  signature: log2(q_sig)={:.2f}, k={}, ell={}, B_MSIS=2^{:.2f}, headroom={:.4f} bits".format(
+        math.log2(p["q_sig"]), p["module_dim"], p["secret_dim"],
+        math.log2(sig["B_MSIS"]), sig["q_half_headroom_bits"],
+    ))
+    print("  entropy: sigma_w'/required={:.2f}, nu_w={} < {:.2f}, H_inf >= {}".format(
+        p["sigma_wprime"] / sig["entropy_rhs"], p["nu_w"],
+        math.log2(p["q_sig"]) - 2, sig["min_entropy_bits"],
+    ))
+    print("  BGV: shape=({},{}), log2(Q)={:.2f} (table {}), ct={:.2f} KB, correctness={}".format(
+        p["bgv_rows"], p["bgv_secret_dim"], bgv["q_bits"],
+        bgv["q_table_bits"], bgv["ciphertext_kb"],
+        "PASS" if bgv["correctness_ok"] else "FAIL",
+    ))
+    print("  extractable commitment: shape=({}, {}, {}), log2(Q_ext)={:.2f}, size={:.2f} KB, extraction={}".format(
+        p["ext_rows"], ext["message_len"], p["ext_randomness"],
+        ext["q_bits"], ext["commitment_kb"],
+        "PASS" if ext["extraction_ok"] else "FAIL",
+    ))
+    print("  SHA3/SHAKE: permutations={}/{}, nonlinear constraints={} (2^{:.2f})".format(
+        zk["sha3_permutations"], zk["shake_permutations"],
+        zk["nonlinear_constraints"], math.log2(zk["nonlinear_constraints"]),
+    ))
+    print("  sizes: vk={:.2f} KB, sig={:.2f} KB, communication={:.2f} KB".format(
+        sig["public_key_kb"], sig["signature_kb"], comm["total_kb"],
+    ))
+    print("  security: VK={}, w'={}, SIG={}, BGV={}, ext-bind={}, ext-hide={}, ext-setup={}, min={} (target={:.0f})".format(
+        fmt_bits(sec["verification_key_mlwe"]), fmt_bits(sec["wprime_mlwe"]),
+        fmt_bits(sec["signature_msis"]), fmt_bits(sec["bgv_ind_cpa_mlwe"]),
+        fmt_bits(sec["ext_binding_msis"]), fmt_bits(sec["ext_hiding_mlwe"]),
+        fmt_bits(sec["ext_setup_mlwe_after_union_bound"]),
+        fmt_bits(sec["minimum"]), target,
+    ))
+    failed = [name for name, ok in result["checks"].items() if not ok]
+    print("  numerical checks:", "PASS" if not failed else "FAIL: " + ", ".join(failed))
+    if not summary_only:
         print("  raw lattice-estimator outputs:")
-        for label, raw in (
-            ("Verification-key MLWE", outputs["verification_key_mlwe"]),
-            ("wprime MLWE", outputs["wprime_mlwe"]),
-            ("Signature MSIS", outputs["signature_msis"]),
-        ):
-            print("    {}:".format(label))
-            for line in raw.splitlines():
-                print("      {}".format(line))
+        for label, raw in result["estimator_outputs"].items():
+            print("    {}: {}".format(label, pprint.pformat(raw, width=100)))
     print("")
 
 
+def jsonable(value):
+    if isinstance(value, dict):
+        return {key: jsonable(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [jsonable(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return pprint.pformat(value, width=100)
+
+
 def parse_args(argv=None):
-    parser = argparse.ArgumentParser(
-        description="Standalone Sage verification of the BRaccoon table parameters."
-    )
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--estimator-path", default="lattice-estimator-main")
     parser.add_argument("--target", type=float, default=128.0)
     parser.add_argument("--full-estimator", action="store_true")
-    parser.add_argument("--json-out", default=None)
-    parser.add_argument("--no-r1cs", action="store_true")
-    parser.add_argument("--r1cs-bdlop-randomness", type=int, default=13)
-    parser.add_argument("--r1cs-bdlop-rows-a", type=int, default=2)
-    parser.add_argument("--r1cs-bdlop-message-len", default="auto")
     parser.add_argument("--summary-only", action="store_true")
-    parser.add_argument("--r1cs-hash-states", default="32")
-    parser.add_argument("--r1cs-hash-alpha", type=int, default=3)
-    parser.add_argument("--r1cs-hash-capacity", default="auto")
-    parser.add_argument("--r1cs-xof-state", type=int, default=11)
-    parser.add_argument("--r1cs-xof-alpha", type=int, default=5)
-    parser.add_argument("--r1cs-xof-capacity", default="auto")
-    parser.add_argument("--r1cs-mu-elements", default="auto")
-    parser.add_argument("--r1cs-w-elements", default="auto")
-    parser.add_argument("--r1cs-msg-elements", type=int, default=256)
-    parser.add_argument("--r1cs-vk-elements", default="auto")
-    args = parser.parse_args(argv)
-    args.r1cs_bdlop_message_len = parse_int_or_auto(args.r1cs_bdlop_message_len)
-    args.r1cs_hash_states = parse_range_or_auto(args.r1cs_hash_states)
-    args.r1cs_hash_capacity = parse_int_or_auto(args.r1cs_hash_capacity)
-    args.r1cs_xof_capacity = parse_int_or_auto(args.r1cs_xof_capacity)
-    args.r1cs_mu_elements = parse_int_or_auto(args.r1cs_mu_elements)
-    args.r1cs_w_elements = parse_int_or_auto(args.r1cs_w_elements)
-    args.r1cs_vk_elements = parse_int_or_auto(args.r1cs_vk_elements)
-    return args
+    parser.add_argument("--json-out", default=None)
+    return parser.parse_args(argv)
 
 
 def main(argv=None):
     args = parse_args(argv)
     LWE, SIS, ND = load_estimator(args.estimator_path)
-
-    print("Standalone BRaccoon parameter verification")
+    print("BRaccoon fixed-parameter certificate (current paper tables)")
     print("target: {:.0f} bits".format(args.target))
     print("estimator: {}".format("full" if args.full_estimator else "rough"))
     print("estimator path: {}".format(resolve_path(args.estimator_path)))
-    print("fixed q: {} (log2(q)={:.2f})".format(TABLE_Q, math.log2(TABLE_Q)))
-    if args.no_r1cs:
-        print("R1CS: skipped")
-    else:
-        print("R1CS: L_1,2 with in-circuit hashes H(vk,msg) and H(mu,w)")
-        print("R1CS convention: msg has {} field elements, vk is a 2*lambda-bit seed".format(
-            args.r1cs_msg_elements,
-        ))
+    print("q_sig: {} (log2={:.2f})".format(SIGNATURE_Q, math.log2(SIGNATURE_Q)))
+    print("mixed-R1CS field: 2^256+1")
+    print("proof-size convention: 110 KB for each of pi_1 and pi_2 (analytical input)")
+    print("BGV numerical profile: binary noise, B_flood=0; circuit-privacy flooding is not certified here")
     print("")
-
-    results = [verify_parameter_set(params, LWE, SIS, ND, args) for params in PARAMETER_SETS]
+    results = [verify_parameter_set(p, LWE, SIS, ND, args) for p in PARAMETER_SETS]
     for result in results:
-        result["summary_only"] = args.summary_only
-        print_result(result, args.target)
-
-    all_pass = all(result["security"]["passes"] for result in results)
-    print("overall:", "PASS" if all_pass else "FAIL")
-
+        print_result(result, args.target, args.summary_only)
+    all_pass = all(result["passes"] for result in results)
+    print("overall numerical certificate:", "PASS" if all_pass else "FAIL")
+    print("analytical caveats: LaBRADOR proof size and circuit-privacy flooding are external assumptions")
     if args.json_out:
-        out_path = Path(args.json_out)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(json.dumps(results, indent=2, sort_keys=True), encoding="utf-8")
-        print("wrote {}".format(out_path))
-
+        out = Path(args.json_out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(jsonable(results), indent=2, sort_keys=True), encoding="utf-8")
+        print("wrote {}".format(out))
     return int(not all_pass)
 
 
-sys.exit(int(main()))
+if __name__ == "__main__":
+    sys.exit(main())

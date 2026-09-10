@@ -23,24 +23,34 @@ copy, they can pass it explicitly:
 sage verify_braccoon_parameters.sage --estimator-path /path/to/lattice-estimator-main
 ```
 
-The Sage file is not a parameter search.  It contains the concrete parameter
-rows from the paper and calls the lattice estimator directly on the resulting
-fixed MLWE/MSIS instances:
+The Sage file is not a parameter search. It contains the three concrete rows
+from the current paper and calls the lattice estimator directly on the fixed
+instances used for:
 
 - verification-key MLWE,
 - `w'`-MLWE,
-- signature MSIS.
+- signature MSIS,
+- binary MLWE-BGV IND-CPA security,
+- binding, hiding, and simulated-setup security of the extractable commitment.
 
-It also recomputes the BRaccoon bounds, signature/public-key sizes, and the R1CS
-constraint estimate for `L_1,2`.  The current convention counts an in-circuit
-Poseidon hash `mu=H(vk,msg)`, where `msg` is represented by 256 field elements
-and `vk` by a `2*lambda`-bit seed, followed by the in-circuit challenge hash
-`H(mu,w)`.
+It also recomputes the current rounded-signature reduction bound, the shifted
+commitment entropy conditions, BGV and extraction no-wrap inequalities, the
+mixed-R1CS field check, signature/public-key/ciphertext/commitment sizes, the
+SHA3-256/SHAKE256 nonlinear constraint count, and the communication table.
+The extractable commitment uses binary opening dimension `rho_ext=15`, the
+smallest tested value whose hiding-MLWE estimate exceeds 128 bits for all three
+rows.
+
+The approximately 110 KB size of each ZK-LaBRADOR proof is an analytical input
+from the cited implementation paper; it is not derived by this script. The
+published BGV numbers correspond to `B_flood=0`. Consequently this certificate
+does not certify a concrete circuit-privacy flooding distribution; such a
+bound must be fixed separately before it can be included in the BGV correctness
+calculation.
 
 ## Useful options
 
 ```bash
-sage verify_braccoon_parameters.sage --no-r1cs
 sage verify_braccoon_parameters.sage --full-estimator
 sage verify_braccoon_parameters.sage --summary-only
 sage verify_braccoon_parameters.sage --json-out results.json

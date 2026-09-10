@@ -42,11 +42,11 @@ smallest tested value whose hiding-MLWE estimate exceeds 128 bits for all three
 rows.
 
 The approximately 110 KB size of each ZK-LaBRADOR proof is an analytical input
-from the cited implementation paper; it is not derived by this script. The
-published BGV numbers correspond to `B_flood=0`. Consequently this certificate
-does not certify a concrete circuit-privacy flooding distribution; such a
-bound must be fixed separately before it can be included in the BGV correctness
-calculation.
+from the cited implementation paper; it is not derived by this script. The BGV
+correctness calculation includes the flooding bound `B_flood=2^40`. This
+certifies decryption no-wrap under that bound, but not by itself the statistical
+translation property of the complete flooding-coin distribution required for
+chosen-key circuit privacy.
 
 ## Useful options
 

@@ -45,7 +45,7 @@ class ParameterSet:
     bgv_rows: int = 10
     bgv_secret_dim: int = 18
     bgv_margin: int = 4
-    bgv_flood_bound: int = 0
+    bgv_flood_bound: int = 2**40
     ext_rows: int = 18
     ext_randomness: int = 15
 
@@ -56,9 +56,9 @@ class ParameterSet:
 
 
 PARAMETER_SETS = (
-    ParameterSet("Q_s=2^20", 2**20, 14, 57, 20.01, 116.74, 662.23),
-    ParameterSet("Q_s=2^32", 2**32, 16, 57, 20.02, 126.76, 712.44),
-    ParameterSet("Q_s=2^64", 2**64, 22, 58, 20.07, 156.87, 863.82),
+    ParameterSet("Q_s=2^20", 2**20, 14, 68, 23.89, 116.74, 720.43),
+    ParameterSet("Q_s=2^32", 2**32, 16, 68, 23.91, 126.76, 778.57),
+    ParameterSet("Q_s=2^64", 2**64, 22, 69, 23.95, 156.87, 953.06),
 )
 
 
@@ -488,14 +488,14 @@ def main(argv=None):
     print("q_sig: {} (log2={:.2f})".format(SIGNATURE_Q, math.log2(SIGNATURE_Q)))
     print("mixed-R1CS field: 2^256+1")
     print("proof-size convention: 110 KB for each of pi_1 and pi_2 (analytical input)")
-    print("BGV numerical profile: binary noise, B_flood=0; circuit-privacy flooding is not certified here")
+    print("BGV numerical profile: binary noise, B_flood=2^40")
     print("")
     results = [verify_parameter_set(p, LWE, SIS, ND, args) for p in PARAMETER_SETS]
     for result in results:
         print_result(result, args.target, args.summary_only)
     all_pass = all(result["passes"] for result in results)
     print("overall numerical certificate:", "PASS" if all_pass else "FAIL")
-    print("analytical caveats: LaBRADOR proof size and circuit-privacy flooding are external assumptions")
+    print("analytical caveats: LaBRADOR proof size and the full-coin flooding distribution are external assumptions")
     if args.json_out:
         out = Path(args.json_out)
         out.parent.mkdir(parents=True, exist_ok=True)
